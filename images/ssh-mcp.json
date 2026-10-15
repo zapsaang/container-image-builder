@@ -1,0 +1,14 @@
+{
+  "name": "ssh-mcp",
+  "enabled": true,
+  "repository": "tufantunc/ssh-mcp",
+  "version": {
+    "strategy": "latest-release"
+  },
+  "build": {
+    "context": ".",
+    "dockerfile": "Dockerfile",
+    "platforms": ["linux/amd64", "linux/arm64"]
+  },
+  "publish_latest": true
+}

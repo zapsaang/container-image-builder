@@ -1,0 +1,122 @@
+name: Publish container images
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Image name to build (or "all")'
+        required: false
+        default: 'all'
+        type: string
+      force:
+        description: 'Force rebuild even if image and platforms exist'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Plan image builds
+        id: plan
+        env:
+          IMAGE_FILTER: ${{ inputs.image || 'all' }}
+        run: python3 scripts/plan.py
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream version and tags
+        id: resolve
+        env:
+          UPSTREAM_REPOSITORY: ${{ matrix.repository }}
+          VERSION_STRATEGY: ${{ matrix.strategy }}
+          PINNED_TAG: ${{ matrix.pinned_tag }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ matrix.name }}
+          PUBLISH_LATEST: ${{ matrix.publish_latest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/resolve.py
+
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ steps.resolve.outputs.version }}
+          path: upstream
+
+      - name: Inspect registry and plan action
+        id: registry
+        env:
+          REGISTRY_IMAGE: ${{ steps.resolve.outputs.image }}
+          IMAGE_VERSION: ${{ steps.resolve.outputs.version }}
+          REQUIRED_PLATFORMS: ${{ matrix.platforms }}
+          PUBLISH_LATEST: ${{ matrix.publish_latest }}
+          FORCE: ${{ inputs.force || false }}
+        run: python3 scripts/registry.py
+
+      - name: Build and push container image
+        if: steps.registry.outputs.action == 'build'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream/${{ matrix.context }}
+          file: ${{ matrix.dockerfile_path }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.resolve.outputs.tags }}
+          provenance: true
+          sbom: true
+
+      - name: Retag latest image
+        if: steps.registry.outputs.action == 'retag'
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.resolve.outputs.image }}:latest" \
+            "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.version }}"
